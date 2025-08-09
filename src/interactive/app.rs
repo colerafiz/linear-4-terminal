@@ -1,6 +1,6 @@
-use crate::models::{Issue, WorkflowState};
 use crate::client::LinearClient;
 use crate::config::get_api_key;
+use crate::models::{Issue, WorkflowState};
 use crossterm::event::KeyCode;
 use std::error::Error;
 
@@ -16,6 +16,7 @@ pub enum AppMode {
     SelectOption,
     ExternalEditor,
     Links,
+    Confirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,13 +63,21 @@ pub struct InteractiveApp {
     pub external_editor_field: Option<EditField>,
     pub current_issue_links: Vec<String>,
     pub selected_link_index: usize,
+    pub confirm_message: String,
+    pub confirm_action: Option<ConfirmAction>,
+    pub confirm_selection: bool, // false = No (default), true = Yes
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmAction {
+    DeleteIssue(String),
 }
 
 impl InteractiveApp {
     pub async fn new() -> Result<Self, Box<dyn Error>> {
         let api_key = get_api_key()?;
         let client = LinearClient::new(api_key);
-        
+
         let mut app = Self {
             mode: AppMode::Normal,
             issues: Vec::new(),
@@ -96,15 +105,18 @@ impl InteractiveApp {
             external_editor_field: None,
             current_issue_links: Vec::new(),
             selected_link_index: 0,
+            confirm_message: String::new(),
+            confirm_action: None,
+            confirm_selection: false,
         };
-        
+
         // Make all three API calls in parallel for faster startup
         let (issues_result, states_result, labels_result) = tokio::join!(
             app.client.get_issues(None, Some(100)),
             app.client.get_workflow_states(),
             app.client.get_labels()
         );
-        
+
         // Handle issues result
         match issues_result {
             Ok(issues) => {
@@ -116,7 +128,7 @@ impl InteractiveApp {
                 return Err(e);
             }
         }
-        
+
         // Handle workflow states result
         match states_result {
             Ok(states) => {
@@ -127,7 +139,7 @@ impl InteractiveApp {
                 app.workflow_states = Vec::new();
             }
         }
-        
+
         // Handle labels result
         match labels_result {
             Ok(labels) => {
@@ -138,7 +150,7 @@ impl InteractiveApp {
                 app.available_labels = Vec::new();
             }
         }
-        
+
         app.loading = false;
         Ok(app)
     }
@@ -146,7 +158,7 @@ impl InteractiveApp {
     pub async fn refresh_issues(&mut self) -> Result<(), Box<dyn Error>> {
         self.loading = true;
         self.error_message = None;
-        
+
         match self.client.get_issues(None, Some(100)).await {
             Ok(issues) => {
                 self.issues = issues;
@@ -164,21 +176,23 @@ impl InteractiveApp {
 
     pub fn apply_filters(&mut self) {
         self.filtered_issues = self.issues.clone();
-        
+
         // Apply search filter
         if !self.search_query.is_empty() {
             let query = self.search_query.to_lowercase();
             self.filtered_issues.retain(|issue| {
-                issue.title.to_lowercase().contains(&query) ||
-                issue.identifier.to_lowercase().contains(&query)
+                issue.title.to_lowercase().contains(&query)
+                    || issue.identifier.to_lowercase().contains(&query)
             });
         }
-        
+
         // Apply sorting based on group_by
         match self.group_by {
             GroupBy::Status => {
                 self.filtered_issues.sort_by(|a, b| {
-                    a.state.name.cmp(&b.state.name)
+                    a.state
+                        .name
+                        .cmp(&b.state.name)
                         .then(a.priority.cmp(&b.priority).reverse())
                 });
             }
@@ -186,13 +200,14 @@ impl InteractiveApp {
                 self.filtered_issues.sort_by(|a, b| {
                     let a_project = a.project.as_ref().map(|p| &p.name);
                     let b_project = b.project.as_ref().map(|p| &p.name);
-                    a_project.cmp(&b_project)
+                    a_project
+                        .cmp(&b_project)
                         .then(a.state.name.cmp(&b.state.name))
                         .then(a.priority.cmp(&b.priority).reverse())
                 });
             }
         }
-        
+
         // Reset selection if needed
         if self.selected_index >= self.filtered_issues.len() && !self.filtered_issues.is_empty() {
             self.selected_index = self.filtered_issues.len() - 1;
@@ -209,8 +224,9 @@ impl InteractiveApp {
             AppMode::Edit => self.handle_edit_mode_key(key),
             AppMode::EditField => self.handle_edit_field_mode_key(key),
             AppMode::SelectOption => self.handle_select_option_mode_key(key),
-            AppMode::ExternalEditor => {}, // External editor is handled in the main loop
+            AppMode::ExternalEditor => {} // External editor is handled in the main loop
             AppMode::Links => self.handle_links_mode_key(key),
+            AppMode::Confirm => self.handle_confirm_mode_key(key),
         }
     }
 
@@ -272,16 +288,40 @@ impl InteractiveApp {
                 // Quick edit labels - go directly to label selection
                 if let Some(issue) = self.get_selected_issue() {
                     let issue_id = issue.id.clone();
-                    let current_label_ids: Vec<String> = issue.labels.nodes.iter()
+                    let current_label_ids: Vec<String> = issue
+                        .labels
+                        .nodes
+                        .iter()
                         .map(|label| label.id.clone())
                         .collect();
-                    
+
                     self.selected_issue_id = Some(issue_id);
                     self.edit_field = EditField::Labels;
                     self.option_index = 0;
                     self.selected_option = None;
                     self.selected_labels = current_label_ids;
                     self.mode = AppMode::SelectOption;
+                }
+            }
+            KeyCode::Char('d') => {
+                // Toggle done status (between completed and unstarted/started)
+                if let Some(issue) = self.get_selected_issue() {
+                    self.selected_issue_id = Some(issue.id.clone());
+                    // We'll trigger the toggle in the async handler
+                }
+            }
+            KeyCode::Char('D') => {
+                // Delete (archive) current issue with confirmation
+                if let Some(issue) = self.get_selected_issue() {
+                    let issue_title = issue.title.clone();
+                    let issue_id = issue.id.clone();
+                    self.confirm_message = format!(
+                        "Are you sure you want to delete issue \"{}\"? (y/n)",
+                        issue_title
+                    );
+                    self.confirm_action = Some(ConfirmAction::DeleteIssue(issue_id));
+                    self.confirm_selection = false; // Default to "No" for safety
+                    self.mode = AppMode::Confirm;
                 }
             }
             _ => {}
@@ -438,7 +478,7 @@ impl InteractiveApp {
     pub fn get_selected_issue(&self) -> Option<&Issue> {
         self.filtered_issues.get(self.selected_index)
     }
-    
+
     fn open_link(&self, url: &str) -> Result<(), Box<dyn Error>> {
         #[cfg(target_os = "macos")]
         let cmd = "open";
@@ -446,12 +486,12 @@ impl InteractiveApp {
         let cmd = "start";
         #[cfg(target_os = "linux")]
         let cmd = "xdg-open";
-        
+
         std::process::Command::new(cmd)
             .arg(url)
             .spawn()
             .map_err(|e| format!("Failed to open link: {}", e))?;
-        
+
         Ok(())
     }
 
@@ -459,7 +499,11 @@ impl InteractiveApp {
         if let Some(issue_id) = &self.selected_issue_id {
             if !self.comment_input.trim().is_empty() {
                 self.loading = true;
-                match self.client.create_comment(issue_id, &self.comment_input).await {
+                match self
+                    .client
+                    .create_comment(issue_id, &self.comment_input)
+                    .await
+                {
                     Ok(_) => {
                         self.loading = false;
                         self.comment_input.clear();
@@ -492,7 +536,8 @@ impl InteractiveApp {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.edit_field_index < 5 { // We have 6 fields (0-5)
+                if self.edit_field_index < 5 {
+                    // We have 6 fields (0-5)
                     self.edit_field_index += 1;
                 }
             }
@@ -507,24 +552,27 @@ impl InteractiveApp {
                     _ => EditField::Title,
                 };
                 self.edit_input.clear();
-                
+
                 // For status, priority, and labels, show selection mode
                 match self.edit_field {
                     EditField::Status | EditField::Priority | EditField::Labels => {
                         self.option_index = 0;
                         self.selected_option = None;
-                        
+
                         // For labels, populate selected_labels with current issue's labels
                         if self.edit_field == EditField::Labels {
                             if let Some(issue) = self.get_selected_issue() {
-                                self.selected_labels = issue.labels.nodes.iter()
+                                self.selected_labels = issue
+                                    .labels
+                                    .nodes
+                                    .iter()
                                     .map(|label| label.id.clone())
                                     .collect();
                             } else {
                                 self.selected_labels.clear();
                             }
                         }
-                        
+
                         self.mode = AppMode::SelectOption;
                     }
                     _ => {
@@ -540,8 +588,12 @@ impl InteractiveApp {
                                     } else {
                                         desc
                                     }
-                                },
-                                EditField::Assignee => issue.assignee.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                                }
+                                EditField::Assignee => issue
+                                    .assignee
+                                    .as_ref()
+                                    .map(|a| a.name.clone())
+                                    .unwrap_or_default(),
                                 _ => String::new(),
                             };
                         }
@@ -642,7 +694,9 @@ impl InteractiveApp {
                         // Toggle label selection with space bar
                         if let Some(label) = self.available_labels.get(self.option_index) {
                             let label_id = label.id.clone();
-                            if let Some(pos) = self.selected_labels.iter().position(|id| id == &label_id) {
+                            if let Some(pos) =
+                                self.selected_labels.iter().position(|id| id == &label_id)
+                            {
                                 self.selected_labels.remove(pos);
                             } else {
                                 self.selected_labels.push(label_id);
@@ -660,7 +714,7 @@ impl InteractiveApp {
             _ => {}
         }
     }
-    
+
     fn handle_links_mode_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -693,7 +747,7 @@ impl InteractiveApp {
                     self.edit_input = issue.description.clone().unwrap_or_default();
                 }
             }
-            
+
             self.external_editor_field = Some(self.edit_field);
             self.mode = AppMode::ExternalEditor;
             Some(self.edit_input.clone())
@@ -701,7 +755,7 @@ impl InteractiveApp {
             None
         }
     }
-    
+
     pub fn handle_external_editor_result(&mut self, content: Option<String>) {
         if let Some(new_content) = content {
             self.edit_input = new_content;
@@ -713,22 +767,44 @@ impl InteractiveApp {
     pub async fn submit_edit(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(issue_id) = &self.selected_issue_id {
             self.loading = true;
-            
+
             let result = match self.edit_field {
                 EditField::Title => {
                     if !self.edit_input.trim().is_empty() {
-                        self.client.update_issue(issue_id, Some(&self.edit_input), None, None, None, None, None).await
+                        self.client
+                            .update_issue(
+                                issue_id,
+                                Some(&self.edit_input),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
                     } else {
                         self.loading = false;
                         return Ok(());
                     }
                 }
                 EditField::Description => {
-                    self.client.update_issue(issue_id, None, Some(&self.edit_input), None, None, None, None).await
+                    self.client
+                        .update_issue(
+                            issue_id,
+                            None,
+                            Some(&self.edit_input),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
                 }
                 EditField::Status => {
                     if let Some(state_id) = &self.selected_option {
-                        self.client.update_issue(issue_id, None, None, Some(state_id), None, None, None).await
+                        self.client
+                            .update_issue(issue_id, None, None, Some(state_id), None, None, None)
+                            .await
                     } else {
                         self.loading = false;
                         return Ok(());
@@ -737,7 +813,17 @@ impl InteractiveApp {
                 EditField::Priority => {
                     if let Some(priority_str) = &self.selected_option {
                         if let Ok(priority) = priority_str.parse::<u8>() {
-                            self.client.update_issue(issue_id, None, None, None, Some(priority), None, None).await
+                            self.client
+                                .update_issue(
+                                    issue_id,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(priority),
+                                    None,
+                                    None,
+                                )
+                                .await
                         } else {
                             self.loading = false;
                             return Ok(());
@@ -754,13 +840,14 @@ impl InteractiveApp {
                     return Ok(());
                 }
                 EditField::Labels => {
-                    let label_ids: Vec<&str> = self.selected_labels.iter()
-                        .map(|s| s.as_str())
-                        .collect();
-                    self.client.update_issue(issue_id, None, None, None, None, None, Some(label_ids)).await
+                    let label_ids: Vec<&str> =
+                        self.selected_labels.iter().map(|s| s.as_str()).collect();
+                    self.client
+                        .update_issue(issue_id, None, None, None, None, None, Some(label_ids))
+                        .await
                 }
             };
-            
+
             match result {
                 Ok(_) => {
                     self.loading = false;
@@ -778,5 +865,142 @@ impl InteractiveApp {
             }
         }
         Ok(())
+    }
+
+    pub async fn toggle_done(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(issue_id) = &self.selected_issue_id {
+            if let Some(issue) = self.get_selected_issue() {
+                let current_state_type = issue.state.state_type.clone();
+
+                self.loading = true;
+                self.error_message = None;
+
+                // Find the appropriate state to toggle to
+                let new_state_id = if current_state_type == "completed" {
+                    // If completed, find an unstarted or started state
+                    self.workflow_states
+                        .iter()
+                        .find(|s| s.state_type == "unstarted" || s.state_type == "started")
+                        .or_else(|| {
+                            self.workflow_states
+                                .iter()
+                                .find(|s| s.state_type == "backlog")
+                        })
+                        .map(|s| s.id.clone())
+                } else {
+                    // If not completed, find a completed state
+                    self.workflow_states
+                        .iter()
+                        .find(|s| s.state_type == "completed")
+                        .map(|s| s.id.clone())
+                };
+
+                if let Some(state_id) = new_state_id {
+                    match self
+                        .client
+                        .update_issue(issue_id, None, None, Some(&state_id), None, None, None)
+                        .await
+                    {
+                        Ok(_) => {
+                            self.loading = false;
+                            // Refresh issues to show the update
+                            let _ = self.refresh_issues().await;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            self.loading = false;
+                            self.error_message =
+                                Some(format!("Failed to toggle done status: {}", e));
+                            Err(e)
+                        }
+                    }
+                } else {
+                    self.loading = false;
+                    self.error_message = Some("No appropriate workflow state found".to_string());
+                    Err("No appropriate workflow state found".into())
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn delete_issue(&mut self, issue_id: &str) -> Result<(), Box<dyn Error>> {
+        self.loading = true;
+        self.error_message = None;
+
+        match self.client.archive_issue(issue_id).await {
+            Ok(success) => {
+                if success {
+                    self.loading = false;
+                    self.mode = AppMode::Normal;
+                    // Refresh issues to remove the deleted one
+                    let _ = self.refresh_issues().await;
+                    Ok(())
+                } else {
+                    self.loading = false;
+                    self.error_message = Some("Failed to delete issue".to_string());
+                    Err("Failed to delete issue".into())
+                }
+            }
+            Err(e) => {
+                self.loading = false;
+                self.error_message = Some(format!("Failed to delete issue: {}", e));
+                Err(e)
+            }
+        }
+    }
+
+    fn handle_confirm_mode_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                // Toggle between Yes and No
+                self.confirm_selection = !self.confirm_selection;
+            }
+            KeyCode::Enter => {
+                if self.confirm_selection {
+                    // User selected "Yes"
+                    if let Some(action) = self.confirm_action.take() {
+                        match action {
+                            ConfirmAction::DeleteIssue(issue_id) => {
+                                // Set the issue_id for deletion and switch to a temporary mode
+                                // The actual deletion will be handled in the main loop
+                                self.selected_issue_id = Some(issue_id);
+                                // We need to trigger the deletion in the main loop
+                                // For now, we'll use a special flag or handle it directly
+                            }
+                        }
+                    }
+                } else {
+                    // User selected "No"
+                    self.mode = AppMode::Normal;
+                    self.confirm_action = None;
+                    self.confirm_message.clear();
+                    self.confirm_selection = false;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(action) = self.confirm_action.take() {
+                    match action {
+                        ConfirmAction::DeleteIssue(issue_id) => {
+                            // Set the issue_id for deletion and switch to a temporary mode
+                            // The actual deletion will be handled in the main loop
+                            self.selected_issue_id = Some(issue_id);
+                            // We need to trigger the deletion in the main loop
+                            // For now, we'll use a special flag or handle it directly
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.confirm_action = None;
+                self.confirm_message.clear();
+                self.confirm_selection = false;
+            }
+            _ => {}
+        }
     }
 }
